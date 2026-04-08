@@ -7,6 +7,7 @@ Activities are the *only* place I/O happens — workflow code stays deterministi
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from temporalio import activity
 
@@ -32,11 +33,13 @@ class StageActivities:
     @activity.defn
     async def submit_stage(self, spec: StageSpec) -> ExternalJobRef:
         adapter = self.registry.get(spec.engine)
+        activity.heartbeat(f"submitting to {spec.engine}")
         return await adapter.submit(spec)
 
     @activity.defn
     async def poll_stage(self, ref: ExternalJobRef) -> ExternalJobState:
         adapter = self.registry.get(ref.engine)
+        activity.heartbeat(f"polling {ref.engine}/{ref.job_id}")
         return await adapter.poll(ref)
 
     @activity.defn
@@ -44,6 +47,7 @@ class StageActivities:
         self, ref: ExternalJobRef
     ) -> ArtifactManifest:
         adapter = self.registry.get(ref.engine)
+        activity.heartbeat(f"collecting artifacts from {ref.engine}/{ref.job_id}")
         return await adapter.collect_artifacts(ref)
 
     @activity.defn
@@ -52,9 +56,12 @@ class StageActivities:
         await adapter.cancel(ref)
 
     @activity.defn
-    async def resume_stage(self, ref: ExternalJobRef, patch: dict) -> ExternalJobRef:
+    async def resume_stage(
+        self, ref: ExternalJobRef, patch: dict[str, Any] | None = None,
+    ) -> ExternalJobRef:
         adapter = self.registry.get(ref.engine)
-        return await adapter.resume(ref, patch)
+        activity.heartbeat(f"resuming {ref.engine}/{ref.job_id}")
+        return await adapter.resume(ref, patch or {})
 
     @activity.defn
     async def collect_debug_bundle(self, ref: ExternalJobRef) -> dict:

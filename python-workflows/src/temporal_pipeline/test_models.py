@@ -1,4 +1,4 @@
-"""Tests for data models — serialization, StageHandle.artifact(), enums."""
+"""Tests for data models — serialization, validation, StageHandle.artifact(), enums."""
 
 from __future__ import annotations
 
@@ -48,6 +48,19 @@ class TestArtifactRef:
         assert ref.uri == "s3://bucket/ckpt"
         assert ref.metadata == {}
 
+    def test_frozen(self):
+        ref = ArtifactRef(name="ckpt", uri="s3://bucket/ckpt")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            ref.name = "other"  # type: ignore[misc]
+
+    def test_empty_name_rejected(self):
+        with pytest.raises(ValueError, match="name must not be empty"):
+            ArtifactRef(name="", uri="s3://bucket/ckpt")
+
+    def test_empty_uri_rejected(self):
+        with pytest.raises(ValueError, match="uri must not be empty"):
+            ArtifactRef(name="ckpt", uri="")
+
     def test_dataclass_asdict(self):
         ref = ArtifactRef(
             name="ckpt",
@@ -58,7 +71,6 @@ class TestArtifactRef:
         d = dataclasses.asdict(ref)
         assert d["name"] == "ckpt"
         assert d["artifact_type"] == "checkpoint"
-        # Ensure JSON-serializable
         json.dumps(d)
 
 
@@ -66,6 +78,10 @@ class TestArtifactManifest:
     def test_empty(self):
         m = ArtifactManifest(stage_name="test", run_id="r1")
         assert m.artifacts == {}
+
+    def test_empty_stage_name_rejected(self):
+        with pytest.raises(ValueError, match="stage_name must not be empty"):
+            ArtifactManifest(stage_name="", run_id="r1")
 
     def test_with_artifacts(self):
         ref = ArtifactRef(name="data", uri="/data")
@@ -111,6 +127,17 @@ class TestStageHandle:
         with pytest.raises(KeyError, match="not found"):
             handle.artifact("missing")
 
+    def test_artifact_empty_name_rejected(self):
+        ref = ArtifactRef(name="x", uri="y")
+        manifest = ArtifactManifest(
+            stage_name="s", run_id="r", artifacts={"x": ref}
+        )
+        handle = StageHandle(
+            stage_name="s", workflow_id="w", run_id="r", manifest=manifest
+        )
+        with pytest.raises(ValueError, match="must not be empty"):
+            handle.artifact("")
+
 
 class TestStageSpec:
     def test_defaults(self):
@@ -118,6 +145,55 @@ class TestStageSpec:
         assert spec.inputs == {}
         assert spec.config == {}
         assert spec.timeout_seconds == 86400
+
+    def test_frozen(self):
+        spec = StageSpec(name="pretrain", engine="torchtitan")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            spec.name = "other"  # type: ignore[misc]
+
+    def test_empty_name_rejected(self):
+        with pytest.raises(ValueError, match="name must not be empty"):
+            StageSpec(name="", engine="torchtitan")
+
+    def test_empty_engine_rejected(self):
+        with pytest.raises(ValueError, match="engine must not be empty"):
+            StageSpec(name="pretrain", engine="")
+
+    def test_non_positive_timeout_rejected(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            StageSpec(name="pretrain", engine="torchtitan", timeout_seconds=0)
+        with pytest.raises(ValueError, match="must be positive"):
+            StageSpec(name="pretrain", engine="torchtitan", timeout_seconds=-1)
+
+
+class TestExternalJobRef:
+    def test_basic(self):
+        ref = ExternalJobRef(engine="torchtitan", job_id="j-123")
+        assert ref.metadata == {}
+
+    def test_frozen(self):
+        ref = ExternalJobRef(engine="torchtitan", job_id="j-123")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            ref.engine = "other"  # type: ignore[misc]
+
+    def test_empty_engine_rejected(self):
+        with pytest.raises(ValueError, match="engine must not be empty"):
+            ExternalJobRef(engine="", job_id="j-123")
+
+    def test_empty_job_id_rejected(self):
+        with pytest.raises(ValueError, match="job_id must not be empty"):
+            ExternalJobRef(engine="torchtitan", job_id="")
+
+
+class TestExternalJobState:
+    def test_basic(self):
+        state = ExternalJobState(state=StageState.RUNNING, progress_pct=0.5)
+        assert state.progress_pct == 0.5
+
+    def test_frozen(self):
+        state = ExternalJobState(state=StageState.RUNNING)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            state.message = "changed"  # type: ignore[misc]
 
 
 class TestRepairPlan:
@@ -130,6 +206,11 @@ class TestRepairPlan:
         assert plan.action == RepairAction.RESUME_FROM_BOUNDARY
         assert len(plan.preserve_artifacts) == 2
 
+    def test_frozen(self):
+        plan = RepairPlan(action=RepairAction.RETRY_STAGE)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            plan.action = RepairAction.ABORT_PIPELINE  # type: ignore[misc]
+
 
 class TestPipelineReq:
     def test_basic(self):
@@ -139,11 +220,32 @@ class TestPipelineReq:
         )
         assert req.pipeline_name == "posttrain"
 
+    def test_empty_name_rejected(self):
+        with pytest.raises(ValueError, match="pipeline_name must not be empty"):
+            PipelineReq(pipeline_name="")
+
 
 class TestFinalArtifacts:
     def test_empty(self):
         fa = FinalArtifacts()
         assert fa.artifacts == {}
+
+
+class TestBugRecord:
+    def test_basic(self):
+        bug = BugRecord(
+            stage_name="rl",
+            error_type="OOM",
+            error_message="Out of memory on rank 3",
+        )
+        assert bug.error_type == "OOM"
+
+    def test_frozen(self):
+        bug = BugRecord(
+            stage_name="rl", error_type="OOM", error_message="msg"
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            bug.error_type = "other"  # type: ignore[misc]
 
 
 class TestSubworkflowHandle:
@@ -163,28 +265,6 @@ class TestStageCarryOver:
         assert carry.state == StageState.CREATED
         assert carry.job_ref is None
         assert carry.event_count == 0
-
-
-class TestExternalJobRef:
-    def test_basic(self):
-        ref = ExternalJobRef(engine="torchtitan", job_id="j-123")
-        assert ref.metadata == {}
-
-
-class TestExternalJobState:
-    def test_basic(self):
-        state = ExternalJobState(state=StageState.RUNNING, progress_pct=0.5)
-        assert state.progress_pct == 0.5
-
-
-class TestBugRecord:
-    def test_basic(self):
-        bug = BugRecord(
-            stage_name="rl",
-            error_type="OOM",
-            error_message="Out of memory on rank 3",
-        )
-        assert bug.error_type == "OOM"
 
 
 class TestJsonRoundtrip:

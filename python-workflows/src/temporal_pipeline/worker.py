@@ -6,6 +6,8 @@ and the user's adapter registry + pipeline workflows.
 
 from __future__ import annotations
 
+from typing import Any
+
 from temporalio.client import Client
 from temporalio.worker import Worker
 
@@ -18,7 +20,7 @@ def create_worker(
     client: Client,
     task_queue: str,
     adapters: dict[str, ExternalAdapter],
-    extra_workflows: list | None = None,
+    extra_workflows: list[type[Any]] | None = None,
 ) -> Worker:
     """Build a Worker with the pipeline SDK's workflows and activities.
 
@@ -33,9 +35,27 @@ def create_worker(
     extra_workflows:
         User-authored pipeline workflow classes to register alongside
         the built-in StageWorkflow.
+
+    Raises
+    ------
+    ValueError
+        If task_queue is empty or adapters is empty.
     """
+    if not task_queue:
+        raise ValueError("task_queue must not be empty")
+    if not adapters:
+        raise ValueError(
+            "At least one adapter must be provided. "
+            "Pass a dict mapping engine names to ExternalAdapter instances."
+        )
+
     registry = AdapterRegistry()
     for engine, adapter in adapters.items():
+        if not isinstance(adapter, ExternalAdapter):
+            raise TypeError(
+                f"Adapter for engine '{engine}' must be an ExternalAdapter, "
+                f"got {type(adapter).__name__}"
+            )
         registry.register(engine, adapter)
 
     acts = StageActivities(registry=registry)

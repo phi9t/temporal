@@ -11,10 +11,10 @@ Queries expose current state without mutating history.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from temporal_pipeline.models import (
@@ -32,6 +32,97 @@ with workflow.unsafe.imports_passed_through():
 _MAX_EVENTS_BEFORE_CAN = 500
 _POLL_INTERVAL = timedelta(seconds=30)
 _MAX_TRANSIENT_RETRIES = 5
+_REPAIR_WAIT_TIMEOUT = timedelta(hours=72)
+
+_SUBMIT_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    maximum_interval=timedelta(seconds=60),
+    backoff_coefficient=2.0,
+    maximum_attempts=5,
+)
+
+_POLL_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=1),
+    maximum_interval=timedelta(seconds=30),
+    backoff_coefficient=2.0,
+    maximum_attempts=3,
+)
+
+_COLLECT_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    maximum_interval=timedelta(seconds=60),
+    backoff_coefficient=2.0,
+    maximum_attempts=5,
+)
+
+_CANCEL_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=1),
+    maximum_interval=timedelta(seconds=30),
+    backoff_coefficient=2.0,
+    maximum_attempts=3,
+)
+
+
+def _as_external_job_ref(raw: object) -> ExternalJobRef:
+    """Safely coerce an activity result into ExternalJobRef."""
+    if isinstance(raw, ExternalJobRef):
+        return raw
+    if isinstance(raw, dict):
+        try:
+            return ExternalJobRef(
+                engine=raw["engine"],
+                job_id=raw["job_id"],
+                metadata=raw.get("metadata", {}),
+            )
+        except KeyError as exc:
+            raise TypeError(
+                f"Cannot convert dict to ExternalJobRef: missing key {exc}"
+            ) from exc
+    raise TypeError(
+        f"Expected ExternalJobRef or dict, got {type(raw).__name__}"
+    )
+
+
+def _as_external_job_state(raw: object) -> ExternalJobState:
+    """Safely coerce an activity result into ExternalJobState."""
+    if isinstance(raw, ExternalJobState):
+        return raw
+    if isinstance(raw, dict):
+        try:
+            return ExternalJobState(
+                state=StageState(raw["state"]),
+                message=raw.get("message", ""),
+                progress_pct=raw.get("progress_pct", 0.0),
+                last_heartbeat=raw.get("last_heartbeat", ""),
+            )
+        except (KeyError, ValueError) as exc:
+            raise TypeError(
+                f"Cannot convert dict to ExternalJobState: {exc}"
+            ) from exc
+    raise TypeError(
+        f"Expected ExternalJobState or dict, got {type(raw).__name__}"
+    )
+
+
+def _as_artifact_manifest(raw: object) -> ArtifactManifest:
+    """Safely coerce an activity result into ArtifactManifest."""
+    if isinstance(raw, ArtifactManifest):
+        return raw
+    if isinstance(raw, dict):
+        try:
+            return ArtifactManifest(
+                stage_name=raw["stage_name"],
+                run_id=raw["run_id"],
+                artifacts=raw.get("artifacts", {}),
+                committed_at=raw.get("committed_at", ""),
+            )
+        except KeyError as exc:
+            raise TypeError(
+                f"Cannot convert dict to ArtifactManifest: missing key {exc}"
+            ) from exc
+    raise TypeError(
+        f"Expected ArtifactManifest or dict, got {type(raw).__name__}"
+    )
 
 
 @workflow.defn
@@ -84,10 +175,12 @@ class StageWorkflow:
             raise ValueError(
                 f"Cannot apply repair in state {self._state}"
             )
+        if self._spec is None:
+            raise ValueError("Cannot apply repair: stage spec not set")
         self._repair_plan = plan
         self._state = StageState.CREATED
         return StageHandle(
-            stage_name=self._spec.name if self._spec else "",
+            stage_name=self._spec.name,
             workflow_id=workflow.info().workflow_id,
             run_id=workflow.info().run_id,
             manifest=self._manifest,
@@ -111,7 +204,10 @@ class StageWorkflow:
     # -- internals -----------------------------------------------------------
 
     async def _execute(self) -> StageHandle:
-        assert self._spec is not None
+        if self._spec is None:
+            raise ValueError("StageWorkflow started without a StageSpec")
+
+        spec = self._spec
 
         if self._state == StageState.CREATED:
             await self._submit()
@@ -120,19 +216,20 @@ class StageWorkflow:
             self._state = StageState.RUNNING
 
         retries = 0
+        poll_event_baseline = self._event_count
         while self._state == StageState.RUNNING:
             if self._cancel_requested:
                 await self._do_cancel()
                 break
 
-            job_state = await workflow.execute_activity(
-                "submit_stage" if self._job_ref is None else "poll_stage",
-                self._job_ref,
-                start_to_close_timeout=timedelta(seconds=60),
+            job_state = _as_external_job_state(
+                await workflow.execute_activity(
+                    "poll_stage",
+                    self._job_ref,
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=_POLL_RETRY,
+                )
             )
-
-            if not isinstance(job_state, ExternalJobState):
-                job_state = ExternalJobState(**job_state) if isinstance(job_state, dict) else job_state
 
             self._event_count += 1
 
@@ -144,25 +241,29 @@ class StageWorkflow:
                 if retries >= _MAX_TRANSIENT_RETRIES:
                     self._state = StageState.BLOCKED_ON_BUG
                     self._bug = BugRecord(
-                        stage_name=self._spec.name,
+                        stage_name=spec.name,
                         error_type="MAX_RETRIES_EXCEEDED",
                         error_message=job_state.message,
                     )
                     break
                 self._state = StageState.FAILED_TRANSIENT
-                await asyncio.sleep(0)
+                await workflow.sleep(min(2**retries, 60))
                 self._state = StageState.RUNNING
             elif job_state.state == StageState.BLOCKED_ON_BUG:
                 self._state = StageState.BLOCKED_ON_BUG
                 self._bug = BugRecord(
-                    stage_name=self._spec.name,
+                    stage_name=spec.name,
                     error_type="EXTERNAL_BUG",
                     error_message=job_state.message,
                 )
                 break
             else:
+                baseline = self._event_count
                 await workflow.wait_condition(
-                    lambda: self._cancel_requested or self._event_count > 0,
+                    lambda baseline=baseline: (
+                        self._cancel_requested
+                        or self._event_count > baseline
+                    ),
                     timeout=_POLL_INTERVAL,
                 )
 
@@ -171,6 +272,7 @@ class StageWorkflow:
         if self._state == StageState.BLOCKED_ON_BUG:
             await workflow.wait_condition(
                 lambda: self._repair_plan is not None or self._cancel_requested,
+                timeout=_REPAIR_WAIT_TIMEOUT,
             )
             if self._cancel_requested:
                 await self._do_cancel()
@@ -178,33 +280,37 @@ class StageWorkflow:
                 return await self._execute()
 
         return StageHandle(
-            stage_name=self._spec.name,
+            stage_name=spec.name,
             workflow_id=workflow.info().workflow_id,
             run_id=workflow.info().run_id,
             manifest=self._manifest,
         )
 
     async def _submit(self) -> None:
-        assert self._spec is not None
+        if self._spec is None:
+            raise ValueError("Cannot submit: stage spec not set")
         self._state = StageState.SUBMITTED
-        self._job_ref = await workflow.execute_activity(
-            "submit_stage",
-            self._spec,
-            start_to_close_timeout=timedelta(seconds=120),
+        self._job_ref = _as_external_job_ref(
+            await workflow.execute_activity(
+                "submit_stage",
+                self._spec,
+                start_to_close_timeout=timedelta(seconds=120),
+                retry_policy=_SUBMIT_RETRY,
+            )
         )
-        if isinstance(self._job_ref, dict):
-            self._job_ref = ExternalJobRef(**self._job_ref)
 
     async def _commit_outputs(self) -> None:
-        assert self._job_ref is not None
+        if self._job_ref is None:
+            raise ValueError("Cannot commit outputs: no job ref")
         self._state = StageState.COMMITTING_OUTPUTS
-        self._manifest = await workflow.execute_activity(
-            "collect_stage_artifacts",
-            self._job_ref,
-            start_to_close_timeout=timedelta(seconds=120),
+        self._manifest = _as_artifact_manifest(
+            await workflow.execute_activity(
+                "collect_stage_artifacts",
+                self._job_ref,
+                start_to_close_timeout=timedelta(seconds=120),
+                retry_policy=_COLLECT_RETRY,
+            )
         )
-        if isinstance(self._manifest, dict):
-            self._manifest = ArtifactManifest(**self._manifest)
         self._state = StageState.SUCCEEDED
 
     async def _do_cancel(self) -> None:
@@ -213,6 +319,7 @@ class StageWorkflow:
                 "cancel_stage",
                 self._job_ref,
                 start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=_CANCEL_RETRY,
             )
         self._state = StageState.PAUSED_FOR_DECISION
 
