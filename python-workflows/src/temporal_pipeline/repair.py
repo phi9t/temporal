@@ -28,7 +28,18 @@ async def resume_from_boundary(
     Returns the subset of *completed_handles* whose stage name is at or
     before *boundary_stage_name* in insertion order — those stages are
     preserved and should not be re-executed.
+
+    Raises ValueError if *boundary_stage_name* is not found in
+    *completed_handles*.
     """
+    if not boundary_stage_name:
+        raise ValueError("boundary_stage_name must not be empty")
+    if boundary_stage_name not in completed_handles:
+        raise ValueError(
+            f"Boundary stage '{boundary_stage_name}' not found in "
+            f"completed handles. Available: {list(completed_handles.keys())}"
+        )
+
     preserved: dict[str, StageHandle] = {}
     for name, handle in completed_handles.items():
         preserved[name] = handle
@@ -41,7 +52,12 @@ async def apply(
     plan: RepairPlan,
     stage_workflow_id: str,
 ) -> StageHandle:
-    """Send a repair update to a running (blocked) StageWorkflow."""
+    """Send a repair update to a running (blocked) StageWorkflow.
+
+    Raises ValueError if stage_workflow_id is empty.
+    """
+    if not stage_workflow_id:
+        raise ValueError("stage_workflow_id must not be empty")
     ext_handle = workflow.get_external_workflow_handle(stage_workflow_id)
     result: StageHandle = await ext_handle.execute_update(
         "apply_repair",

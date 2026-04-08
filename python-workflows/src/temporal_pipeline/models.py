@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any
 
 
@@ -31,7 +30,7 @@ class RepairAction(str, enum.Enum):
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class ArtifactRef:
     """Typed reference to a committed artifact (URI, not payload)."""
 
@@ -41,6 +40,12 @@ class ArtifactRef:
     metadata: dict[str, str] = field(default_factory=dict)
     stage_name: str = ""
     run_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("ArtifactRef.name must not be empty")
+        if not self.uri:
+            raise ValueError("ArtifactRef.uri must not be empty")
 
 
 @dataclass
@@ -52,13 +57,17 @@ class ArtifactManifest:
     artifacts: dict[str, ArtifactRef] = field(default_factory=dict)
     committed_at: str = ""
 
+    def __post_init__(self) -> None:
+        if not self.stage_name:
+            raise ValueError("ArtifactManifest.stage_name must not be empty")
+
 
 # ---------------------------------------------------------------------------
 # External job references
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class ExternalJobRef:
     """Opaque reference to a job running in an external system."""
 
@@ -66,8 +75,14 @@ class ExternalJobRef:
     job_id: str
     metadata: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not self.engine:
+            raise ValueError("ExternalJobRef.engine must not be empty")
+        if not self.job_id:
+            raise ValueError("ExternalJobRef.job_id must not be empty")
 
-@dataclass
+
+@dataclass(frozen=True)
 class ExternalJobState:
     """Normalized status snapshot from an external job system."""
 
@@ -82,7 +97,7 @@ class ExternalJobState:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class StageSpec:
     """Everything needed to submit a stage to an external backend."""
 
@@ -91,6 +106,16 @@ class StageSpec:
     inputs: dict[str, Any] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)
     timeout_seconds: int = 86400
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("StageSpec.name must not be empty")
+        if not self.engine:
+            raise ValueError("StageSpec.engine must not be empty")
+        if self.timeout_seconds <= 0:
+            raise ValueError(
+                f"StageSpec.timeout_seconds must be positive, got {self.timeout_seconds}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +134,8 @@ class StageHandle:
 
     def artifact(self, name: str) -> ArtifactRef:
         """Return a specific artifact ref from this stage's committed manifest."""
+        if not name:
+            raise ValueError("Artifact name must not be empty")
         if self.manifest is None:
             raise ValueError(
                 f"Stage '{self.stage_name}' has no committed manifest yet"
@@ -136,7 +163,7 @@ class SubworkflowHandle:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class BugRecord:
     """Recorded failure / bug info for a stage."""
 
@@ -147,7 +174,7 @@ class BugRecord:
     debug_bundle_uri: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class RepairPlan:
     """Durable recovery action to apply after a bug."""
 
@@ -163,13 +190,17 @@ class RepairPlan:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class PipelineReq:
     """Top-level request to run a pipeline."""
 
     pipeline_name: str
     inputs: dict[str, Any] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.pipeline_name:
+            raise ValueError("PipelineReq.pipeline_name must not be empty")
 
 
 @dataclass

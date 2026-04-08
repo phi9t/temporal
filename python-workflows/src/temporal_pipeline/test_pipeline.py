@@ -95,10 +95,11 @@ async def mock_poll(ref: ExternalJobRef) -> ExternalJobState:
 
 @activity.defn(name="collect_stage_artifacts")
 async def mock_collect(ref: ExternalJobRef) -> ArtifactManifest:
-    stage_name = ref.job_id.replace("mock-", "")
+    stage_name = ref.job_id.removeprefix("mock-")
     arts = _MOCK_ARTIFACTS.get(stage_name, {})
+    # Ensure stage_name is not empty (ArtifactManifest requires it)
     return ArtifactManifest(
-        stage_name=stage_name, run_id="test-run", artifacts=arts
+        stage_name=stage_name or "unknown", run_id="test-run", artifacts=arts
     )
 
 
@@ -166,7 +167,7 @@ class TestArtifactsModule:
             stage_name="s2",
             run_id="r2",
             artifacts={
-                "a": ArtifactRef(name="a", uri="u2"),  # overrides m1
+                "a": ArtifactRef(name="a", uri="u2"),
                 "b": ArtifactRef(name="b", uri="u3"),
             },
         )
@@ -216,6 +217,27 @@ class TestRepairModule:
         )
         assert list(preserved.keys()) == ["data_prep"]
 
+    @pytest.mark.asyncio
+    async def test_resume_from_boundary_not_found(self):
+        handles = {
+            "data_prep": StageHandle(
+                stage_name="data_prep", workflow_id="w1", run_id="r1"
+            ),
+        }
+        with pytest.raises(ValueError, match="not found"):
+            await repair.resume_from_boundary("nonexistent", handles)
+
+    @pytest.mark.asyncio
+    async def test_resume_from_boundary_empty_name(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            await repair.resume_from_boundary("", {})
+
+    @pytest.mark.asyncio
+    async def test_apply_empty_workflow_id(self):
+        plan = RepairPlan(action=RepairAction.RETRY_STAGE)
+        with pytest.raises(ValueError, match="must not be empty"):
+            await repair.apply(plan, "")
+
 
 class TestAdapterRegistry:
     """Test the adapter registry."""
@@ -251,6 +273,33 @@ class TestWorkerFactory:
     def test_create_worker_imports(self):
         from temporal_pipeline.worker import create_worker
         assert callable(create_worker)
+
+
+class TestStagesValidation:
+    """Test stages.py input validation (pure-logic, no server needed)."""
+
+    def test_invalid_stage_name_chars(self):
+        from temporal_pipeline.stages import _validate_name
+        with pytest.raises(ValueError, match="invalid characters"):
+            _validate_name("stage with spaces")
+        with pytest.raises(ValueError, match="invalid characters"):
+            _validate_name("stage/slash")
+
+    def test_empty_stage_name(self):
+        from temporal_pipeline.stages import _validate_name
+        with pytest.raises(ValueError, match="must not be empty"):
+            _validate_name("")
+
+    def test_valid_stage_names(self):
+        from temporal_pipeline.stages import _validate_name
+        _validate_name("data_prep")
+        _validate_name("pretrain-v2")
+        _validate_name("stage123")
+
+    def test_empty_engine(self):
+        from temporal_pipeline.stages import _validate_engine
+        with pytest.raises(ValueError, match="must not be empty"):
+            _validate_engine("")
 
 
 # ---------------------------------------------------------------------------
